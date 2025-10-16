@@ -1,9 +1,10 @@
 import asyncio
 import logging
-from pymodbus.server import StartAsyncTcpServer
-from pymodbus.datastore import ModbusServerContext, ModbusSlaveContext, ModbusSequentialDataBlock
-from pymodbus.device import ModbusDeviceIdentification
-from pymodbus.transaction import ModbusSocketFramer
+
+# Pymodbus imports organized by module
+from pymodbus.server import ModbusTcpServer
+from pymodbus.datastore import ModbusSequentialDataBlock, ModbusDeviceContext
+from pymodbus import ModbusDeviceIdentification
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -12,34 +13,27 @@ logger = logging.getLogger("modbus-server")
 # Constants
 NUM_REGS = 50
 HOST = "0.0.0.0" # Use to enable external connections
-PORT = 5020  # The default port is 502, but you can use 5020 to avoid root privileges.
+PORT = 5020  # Default port is 502, but 5020 avoids the need for root privileges.
 
-def build_datastore():
+def build_datastore() -> ModbusDeviceContext:
     """
-    Creates a datastore with 50 registers of each type.
-    - di: Discrete Inputs (read-only, 0/1)
-    - co: Coils (read/write, 0/1)
-    - hr: Holding Registers (read/write, 16-bit)
-    - ir: Input Registers (read-only, 16-bit)
+    Creates and returns the data context for a single device.
     """
-    # Initialize with some values for visibility
-    discrete_inputs = [0] * NUM_REGS
-    coils = [0] * NUM_REGS
+    discrete_inputs = [False] * NUM_REGS
+    coils = [False] * NUM_REGS
     holding_registers = [i for i in range(NUM_REGS)]
     input_registers = [1000 + i for i in range(NUM_REGS)]
 
-    store = ModbusSlaveContext(
+    store = ModbusDeviceContext(
         di=ModbusSequentialDataBlock(0, discrete_inputs),
         co=ModbusSequentialDataBlock(0, coils),
         hr=ModbusSequentialDataBlock(0, holding_registers),
         ir=ModbusSequentialDataBlock(0, input_registers),
-        zero_mode=True,  # addressing starts at 0
     )
-    context = ModbusServerContext(slaves=store, single=True)
-    return context
+    return store
 
 def build_identity():
-    """Builds Modbus device identification metadata."""
+    """Builds the Modbus device identification metadata."""
     identity = ModbusDeviceIdentification()
     identity.VendorName = "ExampleCorp"
     identity.ProductCode = "PMDB"
@@ -49,33 +43,27 @@ def build_identity():
     identity.MajorMinorRevision = "3.x"
     return identity
 
-async def coils_task(context: ModbusServerContext, period: float = 1.0):
+async def coils_task(context: ModbusDeviceContext, period: float = 1.0):
     """
-    Async task that:
-    - Reads the first 10 coils.
-    - Toggles one coil per iteration (round-robin).
-    - Writes back the updated values.
-    - Logs the state periodically.
+    Asynchronous task that toggles the state of the coils.
     """
-    slave_id = 0x00  # when single=True, the identifier is ignored internally
     toggle_index = 0
 
     while True:
         try:
-            # Read 10 coils starting at address 0
-            rr = context[slave_id].getValues(function=1, address=0, count=10)  # 1 = Read Coils
+            address = 0
+            count = 10
+            
+            rr = context.getValues(1, address, count)
             logger.info(f"Coils (0..9) before: {rr}")
 
-            # Toggle one coil at a time (cyclic)
             new_coils = list(rr)
-            idx = toggle_index % 10
-            new_coils[idx] = 0 if new_coils[idx] else 1
+            idx = toggle_index % count
+            new_coils[idx] = not new_coils[idx]
 
-            # Write back the 10 coils
-            context[slave_id].setValues(function=5, address=0, values=new_coils)  # 5 = Write Single Coil / block
+            context.setValues(15, address, new_coils)
 
-            # Verify write
-            rr_after = context[slave_id].getValues(function=1, address=0, count=10)
+            rr_after = context.getValues(1, address, count)
             logger.info(f"Coils (0..9) after: {rr_after} (toggled idx={idx})")
 
             toggle_index += 1
@@ -84,26 +72,25 @@ async def coils_task(context: ModbusServerContext, period: float = 1.0):
 
         await asyncio.sleep(period)
 
-async def holding_registers_task(context: ModbusServerContext, period: float = 2.0):
+async def holding_registers_task(context: ModbusDeviceContext, period: float = 2.0):
     """
-    Async task that:
-    - Reads 10 holding registers.
-    - Increments the first register and writes back the block.
+    Asynchronous task that increments the holding registers.
     """
-    slave_id = 0x00
-
     while True:
         try:
-            # Read 10 holding registers starting at 0
-            hr_vals = context[slave_id].getValues(function=3, address=0, count=10)  # 3 = Read Holding Registers
+            address = 0
+            count = 10
+            
+            hr_vals = context.getValues(3, address, count)
             logger.info(f"HR (0..9) before: {hr_vals}")
 
-            # Increment the first value and write back the block
             if hr_vals:
-                hr_vals[0] = (hr_vals[0] + 1) & 0xFFFF  # 16-bit wrap
-                context[slave_id].setValues(function=6, address=0, values=hr_vals)  # 6 = Write Single Register / block
+                new_vals = list(hr_vals)
+                new_vals[0] = (new_vals[0] + 1) & 0xFFFF
+                
+                context.setValues(16, address, new_vals)
 
-            hr_after = context[slave_id].getValues(function=3, address=0, count=10)
+            hr_after = context.getValues(3, address, count)
             logger.info(f"HR (0..9) after: {hr_after}")
         except Exception as e:
             logger.exception(f"Error in holding registers task: {e}")
@@ -114,32 +101,26 @@ async def main():
     context = build_datastore()
     identity = build_identity()
 
-    # Start the Async TCP server
-    server = await StartAsyncTcpServer(
+    server = ModbusTcpServer(
         context=context,
         identity=identity,
-        host=HOST,
-        port=PORT,
-        framer=ModbusSocketFramer,
-        allow_reuse_address=True,
-        defer_start=True,  # gives us lifecycle control
+        address=(HOST, PORT)
     )
 
-    logger.info(f"Modbus TCP server started at {HOST}:{PORT}")
+    logger.info(f"Modbus TCP server started on {HOST}:{PORT}")
 
-    # Create periodic read/write tasks
     task1 = asyncio.create_task(coils_task(context, period=1.0))
     task2 = asyncio.create_task(holding_registers_task(context, period=2.0))
 
     try:
-        # Run the server; this call blocks until canceled
         await server.serve_forever()
     except asyncio.CancelledError:
-        logger.info("Server canceled, shutting down...")
+        logger.info("Server cancelled, shutting down...")
     finally:
         task1.cancel()
         task2.cancel()
         await asyncio.gather(task1, task2, return_exceptions=True)
+        await server.shutdown()
 
 if __name__ == "__main__":
     try:
